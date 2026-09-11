@@ -44,8 +44,13 @@ const adminKey = await keyFromPassphrase(PASSPHRASE)
 const strangerKey = await keyFromPassphrase('not-an-admin-passphrase-at-all!!')
 // Stands in for the account owner's new key after a reset.
 const newOwnerKey = await keyFromPassphrase('the accounts brand new passphrase')
+// The key someone replaying a captured request would try to substitute.
+const attackerKey = await keyFromPassphrase('the key an attacker would swap in')
 
-async function call (method, path, { json, key = adminKey } = {}) {
+// `sendInstead` swaps the body after signing, which is what an attacker who
+// captured a valid set of headers would do. The signed digest covers the
+// original body, so the swap has to be refused.
+async function call (method, path, { json, key = adminKey, sendInstead } = {}) {
   const url = `${BASE}${path}`
   const headers = await signCapabilityInvocation({
     url,
@@ -55,10 +60,11 @@ async function call (method, path, { json, key = adminKey } = {}) {
     capabilityAction: method,
     invocationSigner: key.signer()
   })
+  const sentBody = sendInstead ?? json
   const response = await fetch(url, {
     method,
     headers: { ...headers, ...(json ? { 'content-type': 'application/json' } : {}) },
-    ...(json ? { body: JSON.stringify(json) } : {})
+    ...(sentBody ? { body: JSON.stringify(sentBody) } : {})
   })
   const text = await response.text()
   let body
@@ -125,6 +131,22 @@ check('GET /accounts/{email} reads one account', got.status === 200 && got.body.
 const badDid = await call('PUT', `/accounts/${pathSegment(TEST_EMAIL)}/did`, { json: { did: 'did:key:nonsense' } })
 check('a malformed DID is refused', badDid.status === 400, badDid)
 
+// The authorizer is given headers but never the body, so the body has to be
+// authenticated by the handler against the digest the admin signed. Without
+// that, these captured headers would re-key the account to whoever replayed
+// them, recorded against the admin who signed.
+const tampered = await call('PUT', `/accounts/${pathSegment(TEST_EMAIL)}/did`, {
+  json: { did: newOwnerKey.controller, reason: 'legitimate' },
+  sendInstead: { did: attackerKey.controller, reason: 'swapped in transit' }
+})
+check('a body swapped after signing is refused', tampered.status === 401, tampered)
+
+const afterTamper = await dynamo.send(new GetItemCommand({
+  TableName: ACCOUNT_TABLE, Key: { email: { S: TEST_EMAIL } }
+}))
+check('the tampered request changed nothing',
+  afterTamper.Item?.did?.S === strangerKey.controller, afterTamper.Item?.did?.S)
+
 const reset = await call('PUT', `/accounts/${pathSegment(TEST_EMAIL)}/did`, {
   json: { did: newOwnerKey.controller, reason: 'smoke test' }
 })
@@ -156,6 +178,18 @@ const audit = await call('GET', '/audit')
 check('GET /audit lists both actions newest first', audit.status === 200 &&
   audit.body.entries?.[0]?.action === 'account.delete' &&
   audit.body.entries?.[1]?.action === 'account.did.reset', audit.body.entries?.slice(0, 2))
+
+// Paged through the time-ordered index, so "newest first" holds across pages
+// rather than only within one.
+const firstPage = await call('GET', '/audit?limit=1')
+check('GET /audit pages, newest first', firstPage.status === 200 &&
+  firstPage.body.entries?.length === 1 &&
+  firstPage.body.entries[0].action === 'account.delete' &&
+  Boolean(firstPage.body.nextCursor), firstPage.body)
+
+const secondPage = await call('GET', `/audit?limit=1&cursor=${encodeURIComponent(firstPage.body.nextCursor ?? '')}`)
+check('the next page continues where the first left off', secondPage.status === 200 &&
+  secondPage.body.entries?.[0]?.action === 'account.did.reset', secondPage.body.entries)
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) failed.`)
 process.exit(failures === 0 ? 0 : 1)

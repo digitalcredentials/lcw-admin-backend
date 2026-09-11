@@ -26,6 +26,19 @@ const pathEmail = (event) => {
   }
 }
 
+// A record whose detail is unreadable is still a record of something an admin
+// did, and is more important to show than to parse.
+function parseDetail(value) {
+  if (!value) {
+    return undefined
+  }
+  try {
+    return JSON.parse(value)
+  } catch {
+    return { unparsed: value }
+  }
+}
+
 export const handler = async (event) => {
   const email = pathEmail(event)
   if (!email) {
@@ -73,7 +86,7 @@ export const handler = async (event) => {
       action: entry.action?.S,
       adminDid: entry.adminDid?.S,
       adminEmail: entry.adminEmail?.S,
-      detail: entry.detail?.S ? JSON.parse(entry.detail.S) : undefined
+      detail: parseDetail(entry.detail?.S)
     }))
   })
 }

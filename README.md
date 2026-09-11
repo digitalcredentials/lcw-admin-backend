@@ -36,7 +36,7 @@ admin cannot open it, copy it, or destroy it.
 | GET | `/accounts/{email}` | One account, with everything admins have done to it |
 | DELETE | `/accounts/{email}` | Removes the account row, recording it first |
 | PUT | `/accounts/{email}/did` | Replaces the controlling DID |
-| GET | `/audit` | Recorded admin actions, newest first |
+| GET | `/audit` | Recorded admin actions, newest first; `?limit=` and `?cursor=` page |
 
 Three tables are involved. `wallet-test` (the accounts) is **owned by the
 lcw-back-end stack**; this stack references it by name through the
@@ -73,11 +73,37 @@ different and much larger thing than this one.
 Registration stays user-initiated, through the email confirmation flow in
 lcw-back-end.
 
+**The host is pinned in a deployment.** The signed request target is built from
+the caller's own `Host` header, so on its own the host check compares that
+header to itself and binds a signature to nothing in particular. Set
+`ExpectedHost` at deploy time and the authorizer refuses anything signed for a
+different host, so an invocation made against a staging API cannot be replayed
+against a production one. It is empty only locally, where the host is whatever
+port `sam local` is on.
+
+**A request body is authenticated by the handler, not the authorizer.** An HTTP
+API authorizer event carries headers but no body, so verifying the signature
+proves the signed `Digest` header is genuine while proving nothing about the
+bytes that actually arrived. `PUT /accounts/{email}/did` therefore re-checks the
+body against that digest itself and refuses a mismatch, or a body with no signed
+digest at all. Without that, a captured set of valid headers could be replayed
+with a different DID in the body - handing the account to the replayer, recorded
+against the admin whose signature it was.
+
 ## Every action is recorded
 
-`lcw-admin-audit` is append-only: no function in this stack is granted
-`UpdateItem` or `DeleteItem` on it. Each record names the admin who acted
-(DID and email), what they did, to whom, and when.
+`lcw-admin-audit` is append-only in fact, not by convention. Every function
+that writes to it is granted `dynamodb:PutItem` on that table and nothing else,
+and each write is conditional on its key not already existing, so a record can
+neither be altered nor silently overwritten once made. (`DynamoDBWritePolicy`
+would have granted `UpdateItem` as well, which is why the policies here are
+written out longhand. `sam validate` will not tell you that; expanding the
+template with `samtranslator` and reading the roles will.)
+
+Each record names the admin who acted (DID and email), what they did, to whom,
+and when. Nothing destructive proceeds without an identity to attribute it to:
+if the authorizer context is missing, the handler refuses rather than writing an
+anonymous record.
 
 The record is written **before** the account is touched, and it carries enough
 to undo the action:
@@ -88,8 +114,20 @@ to undo the action:
 
 Two consequences follow, both intended. A failure to record aborts the action
 rather than performing it unrecorded. And an action that is recorded but then
-fails leaves a record of something that did not happen - the API says so in its
-response, and the row itself is the evidence.
+fails would leave a record of something that did not happen - so the handler
+appends a second record saying so (`account.delete.aborted`,
+`account.did.reset.aborted`). The log is only ever added to, so a correction is
+another entry, never an edit.
+
+The write itself is conditional on what was read: a DID reset only applies if
+the account still holds the DID the record names as the previous one. A reset
+racing another change returns 409 rather than overwriting a key the log does not
+mention - which would have made the recorded undo restore the wrong one.
+
+Granting and revoking admin rights is recorded too, by `add-admin.mjs`, marked
+as unauthenticated because it is - that script is run by whoever holds AWS
+credentials, and nothing about it is signed. Without those entries, an audit row
+naming a DID could not be tied to a person once that admin was removed.
 
 ## Resetting a controlling DID is a handover
 
@@ -137,6 +175,11 @@ sam local start-api --port 3002 --region us-east-1 \
   --parameter-overrides DynamoEndpointUrl=http://lcw-dynamodb:8000 \
   --warm-containers EAGER
 ```
+
+The script refuses to register a DID that already belongs to another admin: two
+admins sharing one key would make every action signed by it ambiguous, and the
+authorizer refuses such a DID outright rather than attributing an action to
+whichever row an index returned first.
 
 `--passphrase` derives the DID exactly as the wallet does
 (`SHA-256(passphrase)` as the Ed25519 seed). Prefer `--did` outside local
@@ -192,5 +235,7 @@ so far only been saved by an older resolved `undici`.)
 
 Not yet done, and not to be done casually: the accounts table is shared with a
 live sandbox. `AccountTableName` must point at the right table for the
-environment, and the first admin has to be registered with `add-admin.mjs`
-against the deployed `lcw-admin` table before the console can be used at all.
+environment, **`ExpectedHost` must be set to the API's own host** (it is empty
+by default, which is right locally and wrong everywhere else), and the first
+admin has to be registered with `add-admin.mjs` against the deployed
+`lcw-admin` table before the console can be used at all.

@@ -75,10 +75,19 @@ async function getVerifier ({ keyId }) {
 // Verifies that the request was signed by `controller`'s key, over this exact
 // method, host and path. `lookupAdmin` is injected so this stays testable
 // without DynamoDB.
-export async function verifyAdminRequest (event, lookupAdmin) {
+export async function verifyAdminRequest (event, lookupAdmin, { expectedHost } = {}) {
   const headers = event.headers ?? {}
   const method = event.requestContext?.http?.method ?? event.httpMethod
   const host = getHeader(headers, 'Host')
+
+  // The signed target is built from the caller's own Host header, so on its own
+  // the host check compares that header to itself and binds a signature to
+  // nothing. EXPECTED_HOST pins it to this deployment, so an invocation signed
+  // for another one - a staging API, a developer's machine - cannot be
+  // replayed here. Unset only locally, where the host is a sam local port.
+  if (expectedHost && host !== expectedHost) {
+    throw new Error(`Request host ${host} is not ${expectedHost}`)
+  }
   // Rebuilt from the request's own host and protocol rather than hardcoded, so
   // signatures verify under sam local (http://127.0.0.1:<port>) as well as
   // behind API Gateway.

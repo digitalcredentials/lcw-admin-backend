@@ -4,6 +4,7 @@ import {
   PutItemCommand,
   UpdateItemCommand
 } from '@aws-sdk/client-dynamodb'
+import { verifyHeaderValue } from '@interop/http-digest-header'
 
 // Overridden only for local development, where DYNAMO_ENDPOINT_URL points at
 // a DynamoDB substitute; empty in every deployed environment.
@@ -34,19 +35,99 @@ const pathEmail = (event) => {
   }
 }
 
+const getHeader = (headers, name) => {
+  const match = Object.keys(headers ?? {}).find(
+    (key) => key.toLowerCase() === name.toLowerCase()
+  )
+  return match === undefined ? undefined : headers[match]
+}
+
+// Appends one record. Conditional on the key not existing, so a record can
+// never overwrite another; the timestamp is nudged forward on a collision,
+// which only happens when one admin acts on one account twice inside a
+// millisecond. Returns the timestamp actually written.
+async function record({ targetEmail, action, admin, detail }) {
+  let createdAt = Date.now()
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const timestamp = new Date(createdAt).toISOString()
+    try {
+      await dynamoClient.send(new PutItemCommand({
+        TableName: AUDIT_TABLE_NAME,
+        Item: {
+          targetEmail: { S: targetEmail },
+          createdAt: { S: timestamp },
+          // One partition for the whole log, so recent-index can serve it
+          // newest-first across every account.
+          log: { S: 'all' },
+          action: { S: action },
+          adminDid: { S: admin.adminDid },
+          adminEmail: { S: admin.adminEmail },
+          detail: { S: JSON.stringify(detail) }
+        },
+        ConditionExpression: 'attribute_not_exists(targetEmail) AND attribute_not_exists(createdAt)'
+      }))
+      return timestamp
+    } catch (error) {
+      if (error.name !== 'ConditionalCheckFailedException') {
+        throw error
+      }
+      createdAt += 1
+    }
+  }
+  throw new Error('Could not append a unique audit record')
+}
+
 export const handler = async (event) => {
-  const admin = event.requestContext?.authorizer?.lambda ?? {}
+  const context = event.requestContext?.authorizer?.lambda ?? {}
+  const admin = {
+    adminDid: String(context.adminDid ?? ''),
+    adminEmail: String(context.adminEmail ?? '')
+  }
+  // Nothing destructive happens unattributed. An empty identity means the
+  // authorizer context did not arrive, which is a misconfiguration, not a
+  // request to be honoured with an anonymous audit record.
+  if (!admin.adminDid) {
+    console.error('Refusing a DID reset: the request carries no admin identity')
+    return json(500, { error: 'Could not establish who is making this request.' })
+  }
+
   const email = pathEmail(event)
   if (!email) {
     return json(400, { error: 'Missing email in path.' })
   }
 
+  const rawBody = event.isBase64Encoded
+    ? Buffer.from(event.body ?? '', 'base64').toString('utf8')
+    : (event.body ?? '')
+
+  // The signature covers a digest of the body, but the authorizer is never
+  // given the body to check it against - an HTTP API authorizer event carries
+  // headers only. So the body is authenticated here, against the digest the
+  // caller signed. Without this, a captured set of valid headers could be
+  // replayed with a different DID in the body, and the account handed to the
+  // replayer under the original admin's name.
+  const digest = getHeader(event.headers, 'digest')
+  if (!digest) {
+    console.error(`Refusing a DID reset for ${email}: request carried no signed body digest`)
+    return json(401, { error: 'Request body must be covered by a signed digest.' })
+  }
+  try {
+    const { verified } = await verifyHeaderValue({
+      data: Buffer.from(rawBody, 'utf8'),
+      headerValue: digest
+    })
+    if (!verified) {
+      console.error(`Refusing a DID reset for ${email}: body does not match the signed digest`)
+      return json(401, { error: 'Request body does not match its signed digest.' })
+    }
+  } catch (error) {
+    console.error(`Refusing a DID reset for ${email}: digest could not be verified:`, error)
+    return json(401, { error: 'Request body does not match its signed digest.' })
+  }
+
   let did, reason
   try {
-    const rawBody = event.isBase64Encoded
-      ? Buffer.from(event.body ?? '', 'base64').toString('utf8')
-      : event.body
-    ;({ did, reason } = JSON.parse(rawBody ?? '{}'))
+    ({ did, reason } = JSON.parse(rawBody || '{}'))
   } catch {
     return json(400, { error: 'Request body must be valid JSON.' })
   }
@@ -80,28 +161,20 @@ export const handler = async (event) => {
     return json(200, { email, did: newDid, unchanged: true })
   }
 
+  const trimmedReason =
+    typeof reason === 'string' && reason.trim() ? reason.trim() : undefined
+
   // Recorded first, for the same reasons as a deletion, and because this is
   // the more consequential of the two: whoever holds the new key now controls
   // the account and everything in its space. The previous DID is kept so the
   // handover can be undone and so it is always answerable who performed it.
   try {
-    await dynamoClient.send(new PutItemCommand({
-      TableName: AUDIT_TABLE_NAME,
-      Item: {
-        targetEmail: { S: email },
-        createdAt: { S: new Date().toISOString() },
-        action: { S: 'account.did.reset' },
-        adminDid: { S: String(admin.adminDid ?? '') },
-        adminEmail: { S: String(admin.adminEmail ?? '') },
-        detail: {
-          S: JSON.stringify({
-            previousDid,
-            newDid,
-            reason: typeof reason === 'string' && reason.trim() ? reason.trim() : undefined
-          })
-        }
-      }
-    }))
+    await record({
+      targetEmail: email,
+      action: 'account.did.reset',
+      admin,
+      detail: { previousDid, newDid, reason: trimmedReason }
+    })
   } catch (error) {
     console.error('Error recording DID reset:', error)
     return json(500, { error: 'Failed to record the action; the DID was not changed.' })
@@ -112,13 +185,45 @@ export const handler = async (event) => {
       TableName: ACCOUNT_TABLE_NAME,
       Key: { email: { S: email } },
       UpdateExpression: 'SET #did = :did',
-      ConditionExpression: 'attribute_exists(email)',
+      // Conditional on the DID that was read and recorded as the previous one.
+      // Without this, a reset racing another change would overwrite a DID the
+      // log does not mention, and the recorded undo would restore the wrong
+      // key.
+      ConditionExpression: previousDid === undefined
+        ? 'attribute_exists(email) AND attribute_not_exists(#did)'
+        : 'attribute_exists(email) AND #did = :previousDid',
       ExpressionAttributeNames: { '#did': 'did' },
-      ExpressionAttributeValues: { ':did': { S: newDid } }
+      ExpressionAttributeValues: {
+        ':did': { S: newDid },
+        ...(previousDid === undefined ? {} : { ':previousDid': { S: previousDid } })
+      }
     }))
   } catch (error) {
+    const raced = error.name === 'ConditionalCheckFailedException'
     console.error('Error updating DID:', error)
-    return json(500, { error: 'Failed to change the controlling DID.' })
+    // The record above says this reset happened. It did not, so say so in the
+    // log as well as in the response - the log cannot be edited, only added to.
+    try {
+      await record({
+        targetEmail: email,
+        action: 'account.did.reset.aborted',
+        admin,
+        detail: {
+          newDid,
+          reason: trimmedReason,
+          why: raced
+            ? 'The account changed between reading it and writing it; nothing was changed.'
+            : 'The write failed; nothing was changed.'
+        }
+      })
+    } catch (recordError) {
+      console.error('Error recording the aborted DID reset:', recordError)
+    }
+    return json(raced ? 409 : 500, {
+      error: raced
+        ? 'This account changed while the reset was in flight. Nothing was changed; reload and try again.'
+        : 'Failed to change the controlling DID.'
+    })
   }
 
   return json(200, { email, did: newDid, previousDid })

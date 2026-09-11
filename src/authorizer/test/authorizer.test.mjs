@@ -10,7 +10,7 @@ import { Ed25519VerificationKey } from '@interop/ed25519-verification-key'
 import { DynamoDBClient, QueryCommand } from '@aws-sdk/client-dynamodb'
 import { mockClient } from 'aws-sdk-client-mock'
 import { handler } from '../index.mjs'
-import { didFromAuthorization } from '../zcap.mjs'
+import { didFromAuthorization, verifyAdminRequest } from '../zcap.mjs'
 
 const HOST = 'admin-api.example.org'
 const ADMIN_EMAIL = 'admin@example.org'
@@ -103,6 +103,36 @@ test('refuses a request that claims a registered admin keyId it cannot sign for'
 test('refuses an unsigned request', async () => {
   withAdmin(did)
   const result = await handler(event({ path: '/accounts' }))
+  assert.equal(result.isAuthorized, false)
+})
+
+// Without a pinned host, the target is built from the caller's own Host header
+// and the host check compares that header to itself - so a signature made for
+// another deployment would be accepted here.
+test('refuses a request signed for a different deployment when the host is pinned', async () => {
+  const signed = await signedEvent({ path: '/accounts' })
+  const lookup = async () => ({ email: ADMIN_EMAIL })
+
+  await assert.rejects(
+    verifyAdminRequest(signed, lookup, { expectedHost: 'other-api.example.org' }),
+    /is not other-api\.example\.org/
+  )
+  // ...and the same request is fine against the host it was pinned to.
+  const admitted = await verifyAdminRequest(signed, lookup, { expectedHost: HOST })
+  assert.equal(admitted.did, did)
+})
+
+// An action has to be attributable to one person. Two admins sharing a key
+// would make every record written by it ambiguous.
+test('refuses a DID that is registered to more than one admin', async () => {
+  ddbMock.reset()
+  ddbMock.on(QueryCommand).resolves({
+    Items: [
+      { email: { S: 'one@example.org' }, did: { S: did } },
+      { email: { S: 'two@example.org' }, did: { S: did } }
+    ]
+  })
+  const result = await handler(await signedEvent({ path: '/accounts' }))
   assert.equal(result.isAuthorized, false)
 })
 

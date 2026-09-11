@@ -13,6 +13,41 @@ const dynamoClient = new DynamoDBClient(
 const ACCOUNT_TABLE_NAME = process.env.ACCOUNT_TABLE_NAME ?? 'wallet-test'
 const AUDIT_TABLE_NAME = process.env.AUDIT_TABLE_NAME ?? 'lcw-admin-audit'
 
+// Appends one record. Conditional on the key not existing, so a record can
+// never overwrite another; the timestamp is nudged forward on a collision,
+// which only happens when one admin acts on one account twice inside a
+// millisecond.
+async function record({ targetEmail, action, admin, detail }) {
+  let createdAt = Date.now()
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const timestamp = new Date(createdAt).toISOString()
+    try {
+      await dynamoClient.send(new PutItemCommand({
+        TableName: AUDIT_TABLE_NAME,
+        Item: {
+          targetEmail: { S: targetEmail },
+          createdAt: { S: timestamp },
+          // One partition for the whole log, so recent-index can serve it
+          // newest-first across every account.
+          log: { S: 'all' },
+          action: { S: action },
+          adminDid: { S: admin.adminDid },
+          adminEmail: { S: admin.adminEmail },
+          detail: { S: JSON.stringify(detail) }
+        },
+        ConditionExpression: 'attribute_not_exists(targetEmail) AND attribute_not_exists(createdAt)'
+      }))
+      return timestamp
+    } catch (error) {
+      if (error.name !== 'ConditionalCheckFailedException') {
+        throw error
+      }
+      createdAt += 1
+    }
+  }
+  throw new Error('Could not append a unique audit record')
+}
+
 const json = (statusCode, body) => ({
   statusCode,
   headers: { 'Content-Type': 'application/json' },
@@ -29,7 +64,19 @@ const pathEmail = (event) => {
 }
 
 export const handler = async (event) => {
-  const admin = event.requestContext?.authorizer?.lambda ?? {}
+  const context = event.requestContext?.authorizer?.lambda ?? {}
+  const admin = {
+    adminDid: String(context.adminDid ?? ''),
+    adminEmail: String(context.adminEmail ?? '')
+  }
+  // Nothing destructive happens unattributed. An empty identity means the
+  // authorizer context did not arrive, which is a misconfiguration, not a
+  // request to be honoured with an anonymous audit record.
+  if (!admin.adminDid) {
+    console.error('Refusing a deletion: the request carries no admin identity')
+    return json(500, { error: 'Could not establish who is making this request.' })
+  }
+
   const email = pathEmail(event)
   if (!email) {
     return json(400, { error: 'Missing email in path.' })
@@ -64,17 +111,12 @@ export const handler = async (event) => {
   // record of an action that did not complete - the response says so, and the
   // row is still there to prove it.
   try {
-    await dynamoClient.send(new PutItemCommand({
-      TableName: AUDIT_TABLE_NAME,
-      Item: {
-        targetEmail: { S: email },
-        createdAt: { S: new Date().toISOString() },
-        action: { S: 'account.delete' },
-        adminDid: { S: String(admin.adminDid ?? '') },
-        adminEmail: { S: String(admin.adminEmail ?? '') },
-        detail: { S: JSON.stringify({ removed }) }
-      }
-    }))
+    await record({
+      targetEmail: email,
+      action: 'account.delete',
+      admin,
+      detail: { removed }
+    })
   } catch (error) {
     console.error('Error recording deletion:', error)
     return json(500, { error: 'Failed to record the action; nothing was deleted.' })
@@ -87,8 +129,30 @@ export const handler = async (event) => {
       ConditionExpression: 'attribute_exists(email)'
     }))
   } catch (error) {
+    const raced = error.name === 'ConditionalCheckFailedException'
     console.error('Error deleting account:', error)
-    return json(500, { error: 'Failed to delete the account.' })
+    // The record above says this deletion happened. It did not, so say so in
+    // the log as well as in the response - the log cannot be edited, only
+    // added to.
+    try {
+      await record({
+        targetEmail: email,
+        action: 'account.delete.aborted',
+        admin,
+        detail: {
+          why: raced
+            ? 'The account was already gone when the deletion was applied; nothing was changed.'
+            : 'The write failed; nothing was changed.'
+        }
+      })
+    } catch (recordError) {
+      console.error('Error recording the aborted deletion:', recordError)
+    }
+    return json(raced ? 409 : 500, {
+      error: raced
+        ? 'This account was already deleted. Nothing was changed.'
+        : 'Failed to delete the account.'
+    })
   }
 
   // The account's Wallet Attached Storage space is untouched: this API holds no

@@ -25,6 +25,15 @@ Parameters:
     Type: String
     Description: Append-only record of every admin action, declared by this stack.
     Default: lcw-admin-audit
+  ExpectedHost:
+    Type: String
+    Description: >
+      Host this API is reached at (e.g. admin-api.lcw-sandbox.org). When set,
+      the authorizer refuses any invocation signed for a different host, so a
+      signature made against one deployment cannot be replayed against another.
+      Leave empty only for local development, where the host is whatever port
+      sam local is on.
+    Default: ''
   DynamoEndpointUrl:
     Type: String
     Description: >
@@ -107,9 +116,16 @@ Resources:
       Environment:
         Variables:
           ADMIN_TABLE_NAME: !Ref AdminTableName
+          EXPECTED_HOST: !Ref ExpectedHost
       Policies:
-        - DynamoDBReadPolicy:
-            TableName: !Ref AdminTableName
+        # Query on the did-index only: the authorizer answers one question, and
+        # has no reason to be able to read the admin table any other way.
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource:
+                - !GetAtt AdminTable.Arn
+                - !Sub '${AdminTable.Arn}/index/did-index'
       LoggingConfig:
         LogGroup: !Ref AuthorizerLogGroup
     Metadata:
@@ -179,8 +195,10 @@ Resources:
       Handler: index.handler
       Timeout: 10
       Policies:
-        - DynamoDBReadPolicy:
-            TableName: !Ref AccountTableName
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:Scan
+              Resource: !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AccountTableName}
       LoggingConfig:
         LogGroup: !Ref AccountsListLogGroup
       Events:
@@ -205,10 +223,13 @@ Resources:
       CodeUri: src/account-get/
       Handler: index.handler
       Policies:
-        - DynamoDBReadPolicy:
-            TableName: !Ref AccountTableName
-        - DynamoDBReadPolicy:
-            TableName: !Ref AuditTableName
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource: !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AccountTableName}
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource: !GetAtt AuditTable.Arn
       LoggingConfig:
         LogGroup: !Ref AccountGetLogGroup
       Events:
@@ -237,10 +258,18 @@ Resources:
       CodeUri: src/account-delete/
       Handler: index.handler
       Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref AccountTableName
-        - DynamoDBWritePolicy:
-            TableName: !Ref AuditTableName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:DeleteItem
+              Resource: !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AccountTableName}
+            # PutItem only: this is what makes the log append-only in fact and
+            # not merely by convention. DynamoDBWritePolicy would also grant
+            # UpdateItem and DeleteItem.
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt AuditTable.Arn
       LoggingConfig:
         LogGroup: !Ref AccountDeleteLogGroup
       Events:
@@ -267,10 +296,15 @@ Resources:
       CodeUri: src/account-did-put/
       Handler: index.handler
       Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref AccountTableName
-        - DynamoDBWritePolicy:
-            TableName: !Ref AuditTableName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource: !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AccountTableName}
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt AuditTable.Arn
       LoggingConfig:
         LogGroup: !Ref AccountDidPutLogGroup
       Events:
@@ -296,8 +330,12 @@ Resources:
       Handler: index.handler
       Timeout: 10
       Policies:
-        - DynamoDBReadPolicy:
-            TableName: !Ref AuditTableName
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource:
+                - !GetAtt AuditTable.Arn
+                - !Sub '${AuditTable.Arn}/index/recent-index'
       LoggingConfig:
         LogGroup: !Ref AuditListLogGroup
       Events:
@@ -339,8 +377,16 @@ Resources:
           Projection:
             ProjectionType: ALL
 
-  # Append-only: nothing in this stack is granted UpdateItem or DeleteItem on
-  # it. Keyed by the account acted on, so one account's history is a Query.
+  # Append-only in fact: every function that writes here is granted PutItem and
+  # nothing else, and each write is conditional on the key not already existing,
+  # so a record cannot be altered or overwritten once made.
+  #
+  # Keyed by the account acted on, so one account's history is a Query. The
+  # global feed needs a different key, hence recent-index: every record carries
+  # the same partition value, which makes the whole log one time-ordered
+  # partition that can be read newest-first and paged. That is a hot partition
+  # by design, and an acceptable one - the writes are a handful of deliberate
+  # human actions, not traffic.
   AuditTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -351,11 +397,22 @@ Resources:
           AttributeType: S
         - AttributeName: createdAt
           AttributeType: S
+        - AttributeName: log
+          AttributeType: S
       KeySchema:
         - AttributeName: targetEmail
           KeyType: HASH
         - AttributeName: createdAt
           KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: recent-index
+          KeySchema:
+            - AttributeName: log
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
 
 Outputs:
   AdminApiUrl:

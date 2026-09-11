@@ -17,10 +17,13 @@
 // Local development adds --endpoint-url http://localhost:8000, which also
 // creates the table if it is missing. Against real AWS the table belongs to
 // the CloudFormation stack and is never created here.
+import os from 'node:os'
 import {
   DynamoDBClient,
   PutItemCommand,
   DeleteItemCommand,
+  GetItemCommand,
+  QueryCommand,
   ScanCommand,
   CreateTableCommand,
   DescribeTableCommand
@@ -114,12 +117,61 @@ const auditTableDefinition = {
   BillingMode: 'PAY_PER_REQUEST',
   AttributeDefinitions: [
     { AttributeName: 'targetEmail', AttributeType: 'S' },
-    { AttributeName: 'createdAt', AttributeType: 'S' }
+    { AttributeName: 'createdAt', AttributeType: 'S' },
+    { AttributeName: 'log', AttributeType: 'S' }
   ],
   KeySchema: [
     { AttributeName: 'targetEmail', KeyType: 'HASH' },
     { AttributeName: 'createdAt', KeyType: 'RANGE' }
-  ]
+  ],
+  GlobalSecondaryIndexes: [{
+    IndexName: 'recent-index',
+    KeySchema: [
+      { AttributeName: 'log', KeyType: 'HASH' },
+      { AttributeName: 'createdAt', KeyType: 'RANGE' }
+    ],
+    Projection: { ProjectionType: 'ALL' }
+  }]
+}
+
+// Granting and revoking admin rights is itself an administrative act, and the
+// only one that happens outside the API. Without a record here, an audit row
+// naming a DID cannot be tied to a person once that admin is removed.
+//
+// It is marked as unauthenticated because it is: this script is run by whoever
+// holds AWS credentials for the table, and nothing here is signed.
+async function recordAdminChange ({ action, email, detail }) {
+  const by = `${os.userInfo().username}@${os.hostname()}`
+  let createdAt = Date.now()
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const timestamp = new Date(createdAt).toISOString()
+    try {
+      await client.send(new PutItemCommand({
+        TableName: AUDIT_TABLE_NAME,
+        Item: {
+          targetEmail: { S: email },
+          createdAt: { S: timestamp },
+          log: { S: 'all' },
+          action: { S: action },
+          adminDid: { S: 'local:add-admin.mjs' },
+          adminEmail: { S: by },
+          detail: { S: JSON.stringify({ ...detail, unauthenticated: true }) }
+        },
+        ConditionExpression: 'attribute_not_exists(targetEmail) AND attribute_not_exists(createdAt)'
+      }))
+      return
+    } catch (error) {
+      if (error.name === 'ResourceNotFoundException') {
+        console.error(`Warning: no audit table ${AUDIT_TABLE_NAME}; this change was not recorded.`)
+        return
+      }
+      if (error.name !== 'ConditionalCheckFailedException') {
+        throw error
+      }
+      createdAt += 1
+    }
+  }
+  throw new Error('Could not append a unique audit record')
 }
 
 async function list () {
@@ -137,14 +189,52 @@ async function list () {
 }
 
 async function remove (email) {
+  // Read first, so the record says which DID stopped being an admin.
+  const { Item: existing } = await client.send(new GetItemCommand({
+    TableName: TABLE_NAME,
+    Key: { email: { S: email } }
+  }))
+  if (!existing) {
+    console.log(`No admin ${email} in ${TABLE_NAME}; nothing to remove.`)
+    return
+  }
   await client.send(new DeleteItemCommand({
     TableName: TABLE_NAME,
     Key: { email: { S: email } }
   }))
+  await recordAdminChange({
+    action: 'admin.remove',
+    email,
+    detail: { did: existing.did?.S }
+  })
   console.log(`Removed admin ${email} from ${TABLE_NAME}.`)
 }
 
 async function add ({ email, did, name }) {
+  // One DID, one admin. Two rows sharing a DID would make every audit record
+  // written by that key ambiguous about who acted, so the authorizer refuses
+  // to admit such a DID at all - which would lock out both of them.
+  const { Items: sharing = [] } = await client.send(new QueryCommand({
+    TableName: TABLE_NAME,
+    IndexName: 'did-index',
+    KeyConditionExpression: '#did = :did',
+    ExpressionAttributeNames: { '#did': 'did' },
+    ExpressionAttributeValues: { ':did': { S: did } }
+  }))
+  const otherOwner = sharing.find((item) => item.email?.S !== email)
+  if (otherOwner) {
+    fail(
+      `That DID is already registered to ${otherOwner.email?.S}. Two admins ` +
+      'cannot share one key: an action signed by it could not be attributed ' +
+      'to either of them.'
+    )
+  }
+
+  const { Item: previous } = await client.send(new GetItemCommand({
+    TableName: TABLE_NAME,
+    Key: { email: { S: email } }
+  }))
+
   await client.send(new PutItemCommand({
     TableName: TABLE_NAME,
     Item: {
@@ -154,6 +244,11 @@ async function add ({ email, did, name }) {
       ...(name ? { name: { S: name } } : {})
     }
   }))
+  await recordAdminChange({
+    action: previous ? 'admin.rekey' : 'admin.add',
+    email,
+    detail: previous ? { previousDid: previous.did?.S, did } : { did }
+  })
   console.log(`Registered admin ${email}`)
   console.log(`  did: ${did}`)
 }

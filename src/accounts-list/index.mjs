@@ -30,7 +30,12 @@ const decodeCursor = (cursor) =>
 
 export const handler = async (event) => {
   const params = event.queryStringParameters ?? {}
-  const limit = Math.min(Number(params.limit) || DEFAULT_LIMIT, MAX_LIMIT)
+  // A negative or non-numeric limit is a client error, not a reason to hand
+  // DynamoDB something it will reject with a 500.
+  const requested = Number(params.limit)
+  const limit = Number.isFinite(requested) && requested > 0
+    ? Math.min(Math.floor(requested), MAX_LIMIT)
+    : DEFAULT_LIMIT
   const query = (params.q ?? '').trim()
 
   let exclusiveStartKey
