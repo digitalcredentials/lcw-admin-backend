@@ -73,32 +73,60 @@ different and much larger thing than this one.
 Registration stays user-initiated, through the email confirmation flow in
 lcw-back-end.
 
-**The host is pinned in a deployment.** The signed request target is built from
-the caller's own `Host` header, so on its own the host check compares that
-header to itself and binds a signature to nothing in particular. Set
-`ExpectedHost` at deploy time and the authorizer refuses anything signed for a
-different host, so an invocation made against a staging API cannot be replayed
-against a production one. It is empty only locally, where the host is whatever
-port `sam local` is on.
+**The host is pinned, always.** The signed request target is built from the
+caller's own `Host` header, so on its own the host check compares that header to
+itself and binds a signature to nothing in particular. `ExpectedHost` fixes it
+to this deployment, so an invocation made against a staging API cannot be
+replayed against a production one.
 
-**A request body is authenticated by the handler, not the authorizer.** An HTTP
-API authorizer event carries headers but no body, so verifying the signature
-proves the signed `Digest` header is genuine while proving nothing about the
-bytes that actually arrived. `PUT /accounts/{email}/did` therefore re-checks the
-body against that digest itself and refuses a mismatch, or a body with no signed
-digest at all. Without that, a captured set of valid headers could be replayed
-with a different DID in the body - handing the account to the replayer, recorded
-against the admin whose signature it was.
+It has **no default**, deliberately: an empty value disables the check, and a
+parameter that can be omitted is one that eventually will be - a deploy
+accepting defaults would ship with the pinning silently off. Locally, pass
+`ExpectedHost=localhost:3002`; it must match the host the console actually calls,
+letter case aside.
+
+**A request body is authenticated in two places, and needs both.** An HTTP API
+authorizer event carries headers but no body, so verifying the signature proves
+the signed `Digest` header is genuine while proving nothing about the bytes that
+actually arrived; the handler therefore re-checks the body against that digest
+and refuses a mismatch.
+
+That is only worth anything if the digest was signed, and by default it is not
+always required to be. `@interop/http-signature-zcap-verify` adds `digest` to
+the headers a signature must cover **only when the request carries a
+`Content-Type`** - and the caller chooses whether to send one. So the authorizer
+requires `digest` explicitly for every body-carrying method (`POST`, `PUT`,
+`PATCH`). Without that, a signature made over a bodyless request to the same
+target could be replayed with any body and a matching attacker-computed digest:
+the handler's comparison would succeed against the attacker's own number, and
+the account would be handed over, recorded against the admin who signed.
+
+Both halves are tested - the authorizer refuses a body-carrying signature that
+does not cover a digest, and `scripts/smoke.mjs` runs the full swap and strip
+attacks against the running API.
 
 ## Every action is recorded
 
-`lcw-admin-audit` is append-only in fact, not by convention. Every function
-that writes to it is granted `dynamodb:PutItem` on that table and nothing else,
-and each write is conditional on its key not already existing, so a record can
-neither be altered nor silently overwritten once made. (`DynamoDBWritePolicy`
-would have granted `UpdateItem` as well, which is why the policies here are
-written out longhand. `sam validate` will not tell you that; expanding the
-template with `samtranslator` and reading the roles will.)
+`lcw-admin-audit` is append-only to this API. Every function that writes to it
+is granted `dynamodb:PutItem` on that table and nothing else, and each write is
+conditional on its key not already existing, so a record can neither be altered
+nor silently overwritten through the API. (`DynamoDBWritePolicy` would have
+granted `UpdateItem` as well, which is why the policies here are written out
+longhand. `sam validate` will not tell you that; expanding the template with
+`samtranslator` and reading the roles will.)
+
+What that does **not** cover: whoever holds AWS credentials for the table can
+edit or delete rows directly, and `scripts/add-admin.mjs` writes to it as that
+principal. The guarantee is against the API being turned against its own log,
+not against the account that owns the table.
+
+Every writer goes through one recorder ([`src/shared/audit.mjs`](src/shared/audit.mjs)),
+so the `log` partition value the global feed depends on exists in a single
+place. A writer that omitted it would keep working - the record would land, and
+show under the account - while vanishing from `GET /audit`. The recorder is also
+retry-safe: a `PutItem` whose response is lost is retried by the SDK, and that
+retry fails its own condition, which taken for a collision would append a second
+copy of one action to a log that cannot be corrected.
 
 Each record names the admin who acted (DID and email), what they did, to whom,
 and when. Nothing destructive proceeds without an identity to attribute it to:
@@ -172,14 +200,21 @@ node scripts/add-admin.mjs --endpoint-url http://localhost:8000 \
 # the admin API, on :3002
 sam local start-api --port 3002 --region us-east-1 \
   --docker-network lcw-local \
-  --parameter-overrides DynamoEndpointUrl=http://lcw-dynamodb:8000 \
+  --parameter-overrides DynamoEndpointUrl=http://lcw-dynamodb:8000 ExpectedHost=localhost:3002 \
   --warm-containers EAGER
 ```
 
 The script refuses to register a DID that already belongs to another admin: two
 admins sharing one key would make every action signed by it ambiguous, and the
 authorizer refuses such a DID outright rather than attributing an action to
-whichever row an index returned first.
+whichever row an index returned first. (The check reads a GSI, which cannot be
+read consistently, so two registrations racing each other could still both land
+- the authorizer then refuses that DID until one row is removed.)
+
+Re-running it with the same DID does nothing and records nothing: the log is a
+record of changes, not of invocations. A grant or revocation is recorded
+**before** it is applied, as in the API, and a missing audit table aborts the
+change rather than proceeding unrecorded.
 
 `--passphrase` derives the DID exactly as the wallet does
 (`SHA-256(passphrase)` as the Ed25519 seed). Prefer `--did` outside local
@@ -234,8 +269,21 @@ so far only been saved by an older resolved `undici`.)
 ## Deploying
 
 Not yet done, and not to be done casually: the accounts table is shared with a
-live sandbox. `AccountTableName` must point at the right table for the
-environment, **`ExpectedHost` must be set to the API's own host** (it is empty
-by default, which is right locally and wrong everywhere else), and the first
-admin has to be registered with `add-admin.mjs` against the deployed
-`lcw-admin` table before the console can be used at all.
+live sandbox.
+
+- `AccountTableName` defaults to `wallet-test`. That default is the test table,
+  and it is the wrong one to administer by accident - set it explicitly.
+- `ExpectedHost` has no default and must be the host the console will call. The
+  stack creates only an `execute-api` host, whose name is not known until it
+  exists, so a first deploy needs either a custom domain decided up front or a
+  second deploy once `AdminApiUrl` is known.
+- Register the first admin with `add-admin.mjs` against the deployed
+  `lcw-admin` table; the console cannot be used at all until one exists.
+- Neither table sets `DeletionPolicy: Retain` or point-in-time recovery. Before
+  this is used for anything that matters, it should: `TableName` is a
+  replacement-triggering property, so renaming a table parameter would delete
+  the audit log rather than rename it.
+- `recent-index` is sparse on the `log` attribute, which every record written by
+  this code carries. If a deployment ever predates that attribute, its older
+  records will be missing from `GET /audit` (though still visible under the
+  account) until they are backfilled.

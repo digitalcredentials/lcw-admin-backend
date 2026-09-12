@@ -12,6 +12,15 @@ didKeyDriver.use({
 
 const baseDocumentLoader = securityLoader()
 
+// Methods that can carry a body. For these the signature must cover `digest`,
+// so that a handler comparing the body to that header is comparing it to
+// something the signer vouched for. The verifier only requires `digest` when
+// the request carries a `content-type` (dist/index.js: 'if
+// (reqHeaders['content-type'])'), and content-type is chosen by the caller -
+// so without this, a signature made over a bodyless request could be replayed
+// with any body and a matching attacker-computed digest.
+const BODY_CARRYING_METHODS = new Set(['POST', 'PUT', 'PATCH'])
+
 // API Gateway passes headers through with whatever casing the client sent, and
 // sam local preserves the original casing, so header reads are case-insensitive.
 export function getHeader (headers, name) {
@@ -85,7 +94,9 @@ export async function verifyAdminRequest (event, lookupAdmin, { expectedHost } =
   // nothing. EXPECTED_HOST pins it to this deployment, so an invocation signed
   // for another one - a staging API, a developer's machine - cannot be
   // replayed here. Unset only locally, where the host is a sam local port.
-  if (expectedHost && host !== expectedHost) {
+  // Host comparison is case-insensitive: RFC 9110 makes host names so, and a
+  // 403 over letter case would be indistinguishable from a real refusal.
+  if (expectedHost && host?.toLowerCase() !== expectedHost.toLowerCase()) {
     throw new Error(`Request host ${host} is not ${expectedHost}`)
   }
   // Rebuilt from the request's own host and protocol rather than hardcoded, so
@@ -117,7 +128,8 @@ export async function verifyAdminRequest (event, lookupAdmin, { expectedHost } =
     expectedHost: host,
     expectedAction: method,
     expectedTarget: url,
-    expectedRootCapability: 'urn:zcap:root:' + encodeURIComponent(url)
+    expectedRootCapability: 'urn:zcap:root:' + encodeURIComponent(url),
+    additionalHeaders: BODY_CARRYING_METHODS.has(method) ? ['digest'] : []
   })
 
   if (!result.verified) {

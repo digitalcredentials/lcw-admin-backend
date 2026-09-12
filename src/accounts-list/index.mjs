@@ -25,8 +25,25 @@ const toAccount = (item) => ({
 // A cursor is just DynamoDB's LastEvaluatedKey, opaque to the client.
 const encodeCursor = (key) =>
   key ? Buffer.from(JSON.stringify(key), 'utf8').toString('base64url') : undefined
-const decodeCursor = (cursor) =>
-  cursor ? JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) : undefined
+// A cursor is opaque to clients, so anything that is not the shape DynamoDB
+// handed out is a client error. Parsing alone is not enough of a check: '1'
+// and '[]' are valid JSON and would reach DynamoDB, which rejects them as a
+// server-side validation failure and so would be reported as a 500.
+const decodeCursor = (cursor) => {
+  if (!cursor) {
+    return undefined
+  }
+  const key = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'))
+  const valid =
+    typeof key === 'object' && key !== null && !Array.isArray(key) &&
+    Object.values(key).every(
+      (value) => typeof value === 'object' && value !== null && typeof value.S === 'string'
+    )
+  if (!valid) {
+    throw new TypeError('Cursor is not a DynamoDB key')
+  }
+  return key
+}
 
 export const handler = async (event) => {
   const params = event.queryStringParameters ?? {}
@@ -34,7 +51,9 @@ export const handler = async (event) => {
   // DynamoDB something it will reject with a 500.
   const requested = Number(params.limit)
   const limit = Number.isFinite(requested) && requested > 0
-    ? Math.min(Math.floor(requested), MAX_LIMIT)
+    // Math.max keeps a fraction below 1 from flooring to 0, which DynamoDB
+    // rejects outright - the 500 this parsing exists to avoid.
+    ? Math.min(Math.max(Math.floor(requested), 1), MAX_LIMIT)
     : DEFAULT_LIMIT
   const query = (params.q ?? '').trim()
 

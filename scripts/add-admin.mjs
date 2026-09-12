@@ -26,9 +26,11 @@ import {
   QueryCommand,
   ScanCommand,
   CreateTableCommand,
-  DescribeTableCommand
+  DescribeTableCommand,
+  UpdateTableCommand
 } from '@aws-sdk/client-dynamodb'
 import { Ed25519VerificationKey } from '@interop/ed25519-verification-key'
+import { appendRecord } from '../src/shared/audit.mjs'
 
 const DID_KEY_PATTERN = /^did:key:z6Mk[1-9A-HJ-NP-Za-km-z]{44}$/
 
@@ -88,7 +90,24 @@ async function didFromPassphrase (passphrase) {
 async function ensureLocalTable (definition) {
   if (!ENDPOINT) return
   try {
-    await client.send(new DescribeTableCommand({ TableName: definition.TableName }))
+    const { Table } = await client.send(new DescribeTableCommand({
+      TableName: definition.TableName
+    }))
+    // Existing is not the same as current. A table created before an index was
+    // added keeps working for writes and fails only on the query that needs
+    // it, which surfaces as an opaque 500 from the API.
+    const present = new Set((Table?.GlobalSecondaryIndexes ?? []).map((index) => index.IndexName))
+    const missing = (definition.GlobalSecondaryIndexes ?? []).filter(
+      (index) => !present.has(index.IndexName)
+    )
+    for (const index of missing) {
+      await client.send(new UpdateTableCommand({
+        TableName: definition.TableName,
+        AttributeDefinitions: definition.AttributeDefinitions,
+        GlobalSecondaryIndexUpdates: [{ Create: index }]
+      }))
+      console.log(`Added missing index ${index.IndexName} to ${definition.TableName}`)
+    }
     return
   } catch (error) {
     if (error.name !== 'ResourceNotFoundException') throw error
@@ -139,39 +158,18 @@ const auditTableDefinition = {
 // naming a DID cannot be tied to a person once that admin is removed.
 //
 // It is marked as unauthenticated because it is: this script is run by whoever
-// holds AWS credentials for the table, and nothing here is signed.
+// holds AWS credentials for the table, and nothing here is signed. It goes
+// through the same appendRecord as every handler, so the log has one writer.
 async function recordAdminChange ({ action, email, detail }) {
-  const by = `${os.userInfo().username}@${os.hostname()}`
-  let createdAt = Date.now()
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const timestamp = new Date(createdAt).toISOString()
-    try {
-      await client.send(new PutItemCommand({
-        TableName: AUDIT_TABLE_NAME,
-        Item: {
-          targetEmail: { S: email },
-          createdAt: { S: timestamp },
-          log: { S: 'all' },
-          action: { S: action },
-          adminDid: { S: 'local:add-admin.mjs' },
-          adminEmail: { S: by },
-          detail: { S: JSON.stringify({ ...detail, unauthenticated: true }) }
-        },
-        ConditionExpression: 'attribute_not_exists(targetEmail) AND attribute_not_exists(createdAt)'
-      }))
-      return
-    } catch (error) {
-      if (error.name === 'ResourceNotFoundException') {
-        console.error(`Warning: no audit table ${AUDIT_TABLE_NAME}; this change was not recorded.`)
-        return
-      }
-      if (error.name !== 'ConditionalCheckFailedException') {
-        throw error
-      }
-      createdAt += 1
-    }
-  }
-  throw new Error('Could not append a unique audit record')
+  return appendRecord(client, AUDIT_TABLE_NAME, {
+    targetEmail: email,
+    action,
+    admin: {
+      adminDid: 'local:add-admin.mjs',
+      adminEmail: `${os.userInfo().username}@${os.hostname()}`
+    },
+    detail: { ...detail, unauthenticated: true }
+  })
 }
 
 async function list () {
@@ -198,15 +196,17 @@ async function remove (email) {
     console.log(`No admin ${email} in ${TABLE_NAME}; nothing to remove.`)
     return
   }
-  await client.send(new DeleteItemCommand({
-    TableName: TABLE_NAME,
-    Key: { email: { S: email } }
-  }))
+  // Recorded first. A revocation that happens without a record is the one
+  // outcome this function exists to prevent, so a failure to record aborts it.
   await recordAdminChange({
     action: 'admin.remove',
     email,
     detail: { did: existing.did?.S }
   })
+  await client.send(new DeleteItemCommand({
+    TableName: TABLE_NAME,
+    Key: { email: { S: email } }
+  }))
   console.log(`Removed admin ${email} from ${TABLE_NAME}.`)
 }
 
@@ -232,23 +232,42 @@ async function add ({ email, did, name }) {
 
   const { Item: previous } = await client.send(new GetItemCommand({
     TableName: TABLE_NAME,
-    Key: { email: { S: email } }
+    Key: { email: { S: email } },
+    ConsistentRead: true
   }))
+
+  // Re-running the documented setup command must not look like a key change.
+  // Nothing is written at all when nothing differs, so the log stays a record
+  // of changes rather than of invocations.
+  const unchanged =
+    previous?.did?.S === did && (previous?.name?.S ?? undefined) === name
+  if (unchanged) {
+    console.log(`Admin ${email} is already registered with that DID; nothing to do.`)
+    console.log(`  did: ${did}`)
+    return
+  }
+
+  if (previous) {
+    await recordAdminChange({
+      action: 'admin.rekey',
+      email,
+      detail: { previousDid: previous.did?.S, newDid: did }
+    })
+  } else {
+    await recordAdminChange({ action: 'admin.add', email, detail: { newDid: did } })
+  }
 
   await client.send(new PutItemCommand({
     TableName: TABLE_NAME,
     Item: {
       email: { S: email },
       did: { S: did },
-      createdAt: { S: new Date().toISOString() },
+      // Preserved on a re-key: it records when this person became an admin,
+      // not when their key last changed, which the log already says.
+      createdAt: { S: previous?.createdAt?.S ?? new Date().toISOString() },
       ...(name ? { name: { S: name } } : {})
     }
   }))
-  await recordAdminChange({
-    action: previous ? 'admin.rekey' : 'admin.add',
-    email,
-    detail: previous ? { previousDid: previous.did?.S, did } : { did }
-  })
   console.log(`Registered admin ${email}`)
   console.log(`  did: ${did}`)
 }

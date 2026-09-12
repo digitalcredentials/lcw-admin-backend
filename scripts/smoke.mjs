@@ -9,6 +9,7 @@
 // create, so it is safe to run alongside the wallet's own local stack.
 import '@interop/http-client'
 import { signCapabilityInvocation } from '@interop/http-signature-zcap-invoke'
+import { createHeaderValue } from '@interop/http-digest-header'
 import { Ed25519VerificationKey } from '@interop/ed25519-verification-key'
 import { DynamoDBClient, PutItemCommand, GetItemCommand } from '@aws-sdk/client-dynamodb'
 
@@ -19,7 +20,7 @@ const args = Object.fromEntries(
   }, [])
 )
 
-const BASE = (args.base ?? 'http://127.0.0.1:3002').replace(/\/+$/, '')
+const BASE = (args.base ?? 'http://localhost:3002').replace(/\/+$/, '')
 const ENDPOINT = args['endpoint-url'] ?? 'http://localhost:8000'
 const ACCOUNT_TABLE = args['account-table'] ?? 'wallet-test'
 const PASSPHRASE = args.passphrase ?? 'admin-secret-seed-that-is-long-e'
@@ -106,8 +107,29 @@ await dynamo.send(new PutItemCommand({
 }))
 console.log(`Seeded ${TEST_EMAIL}\n`)
 
-const login = await call('POST', '/login')
+// A body, even an empty one: the authorizer requires body-carrying methods to
+// sign a digest, so an unsigned-body POST is refused by design.
+const login = await call('POST', '/login', { json: {} })
 check('POST /login identifies the admin', login.status === 200 && login.body.did === adminKey.controller, login)
+
+// Signed for the same target but with no body, then replayed with one. The
+// signature cannot cover a digest it never had, so the authorizer refuses it
+// before any handler sees it.
+const stripped = await (async () => {
+  const url = `${BASE}/accounts/${pathSegment(TEST_EMAIL)}/did`
+  const headers = await signCapabilityInvocation({
+    url,
+    method: 'PUT',
+    headers: { host: new URL(url).host },
+    capabilityAction: 'PUT',
+    invocationSigner: adminKey.signer()
+  })
+  const body = JSON.stringify({ did: attackerKey.controller })
+  const digest = await createHeaderValue({ data: new TextEncoder().encode(body) })
+  const response = await fetch(url, { method: 'PUT', headers: { ...headers, digest }, body })
+  return response.status
+})()
+check('a body added to a signature that never covered one is refused', stripped === 403, stripped)
 
 const stranger = await call('GET', '/accounts', { key: strangerKey })
 check('a non-admin is refused', stranger.status === 403, stranger)

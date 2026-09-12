@@ -136,6 +136,36 @@ test('refuses a DID that is registered to more than one admin', async () => {
   assert.equal(result.isAuthorized, false)
 })
 
+// A signature can only cover a digest if one existed when it was made. The
+// verifier requires `digest` to be signed only when the request carries a
+// content-type - which the caller chooses - so without an explicit rule a
+// bodyless signature could be replayed with any body and a matching digest.
+test('refuses a body-carrying method whose signature does not cover a digest', async () => {
+  withAdmin(did)
+  const signed = await signedEvent({ path: '/accounts/x@example.org/did', method: 'PUT' })
+  // The body never reaches the authorizer; what matters is that the signature
+  // did not commit to one.
+  signed.headers.digest = 'mh=uEiAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+  const result = await handler(signed)
+  assert.equal(result.isAuthorized, false)
+})
+
+test('admits a body-carrying method whose signature does cover its digest', async () => {
+  withAdmin(did)
+  const url = `https://${HOST}/accounts/x@example.org/did`
+  const json = { did: 'did:key:z6MkfDLjE5Kip9E7YRitEbrNAcCYi2AviAY8Ny7hoYnCSgav' }
+  const headers = await signCapabilityInvocation({
+    url,
+    method: 'PUT',
+    headers: { host: HOST },
+    json,
+    capabilityAction: 'PUT',
+    invocationSigner: key.signer()
+  })
+  const result = await handler(event({ path: '/accounts/x@example.org/did', method: 'PUT', headers }))
+  assert.equal(result.isAuthorized, true)
+})
+
 // The reason the authorizer result cache is disabled: a signature authorizes
 // one request, not the caller.
 test('refuses a signature replayed against a different route', async () => {

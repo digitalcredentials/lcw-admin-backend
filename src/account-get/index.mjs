@@ -50,7 +50,11 @@ export const handler = async (event) => {
     const [accountResult, historyResult] = await Promise.all([
       dynamoClient.send(new GetItemCommand({
         TableName: ACCOUNT_TABLE_NAME,
-        Key: { email: { S: email } }
+        Key: { email: { S: email } },
+        // The console reloads this immediately after a reset or a delete, so
+        // an eventually-consistent read here would show the admin the state
+        // their own action just replaced.
+        ConsistentRead: true
       })),
       // Newest first. An account's whole history is one query because the
       // audit table is keyed by the account acted on.
@@ -59,6 +63,7 @@ export const handler = async (event) => {
         KeyConditionExpression: 'targetEmail = :email',
         ExpressionAttributeValues: { ':email': { S: email } },
         ScanIndexForward: false,
+        ConsistentRead: true,
         Limit: 50
       }))
     ])

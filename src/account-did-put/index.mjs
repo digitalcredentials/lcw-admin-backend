@@ -1,7 +1,7 @@
+import { appendRecord } from '../shared/audit.mjs'
 import {
   DynamoDBClient,
   GetItemCommand,
-  PutItemCommand,
   UpdateItemCommand
 } from '@aws-sdk/client-dynamodb'
 import { verifyHeaderValue } from '@interop/http-digest-header'
@@ -42,40 +42,6 @@ const getHeader = (headers, name) => {
   return match === undefined ? undefined : headers[match]
 }
 
-// Appends one record. Conditional on the key not existing, so a record can
-// never overwrite another; the timestamp is nudged forward on a collision,
-// which only happens when one admin acts on one account twice inside a
-// millisecond. Returns the timestamp actually written.
-async function record({ targetEmail, action, admin, detail }) {
-  let createdAt = Date.now()
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const timestamp = new Date(createdAt).toISOString()
-    try {
-      await dynamoClient.send(new PutItemCommand({
-        TableName: AUDIT_TABLE_NAME,
-        Item: {
-          targetEmail: { S: targetEmail },
-          createdAt: { S: timestamp },
-          // One partition for the whole log, so recent-index can serve it
-          // newest-first across every account.
-          log: { S: 'all' },
-          action: { S: action },
-          adminDid: { S: admin.adminDid },
-          adminEmail: { S: admin.adminEmail },
-          detail: { S: JSON.stringify(detail) }
-        },
-        ConditionExpression: 'attribute_not_exists(targetEmail) AND attribute_not_exists(createdAt)'
-      }))
-      return timestamp
-    } catch (error) {
-      if (error.name !== 'ConditionalCheckFailedException') {
-        throw error
-      }
-      createdAt += 1
-    }
-  }
-  throw new Error('Could not append a unique audit record')
-}
 
 export const handler = async (event) => {
   const context = event.requestContext?.authorizer?.lambda ?? {}
@@ -145,7 +111,10 @@ export const handler = async (event) => {
   try {
     ({ Item: account } = await dynamoClient.send(new GetItemCommand({
       TableName: ACCOUNT_TABLE_NAME,
-      Key: { email: { S: email } }
+      Key: { email: { S: email } },
+      // The DID read here is both recorded as the previous one and used as the
+      // write condition, so it has to be the row as it actually is.
+      ConsistentRead: true
     })))
   } catch (error) {
     console.error('Error reading account before DID reset:', error)
@@ -158,7 +127,10 @@ export const handler = async (event) => {
 
   const previousDid = account.did?.S
   if (previousDid?.split('#')[0] === newDid) {
-    return json(200, { email, did: newDid, unchanged: true })
+    // Reported as stored, not as submitted: a stored DID may carry a key
+    // fragment, and answering with the bare form would assert a value the
+    // table does not hold.
+    return json(200, { email, did: previousDid, unchanged: true })
   }
 
   const trimmedReason =
@@ -168,8 +140,9 @@ export const handler = async (event) => {
   // the more consequential of the two: whoever holds the new key now controls
   // the account and everything in its space. The previous DID is kept so the
   // handover can be undone and so it is always answerable who performed it.
+  let recordedAt
   try {
-    await record({
+    recordedAt = await appendRecord(dynamoClient, AUDIT_TABLE_NAME, {
       targetEmail: email,
       action: 'account.did.reset',
       admin,
@@ -204,11 +177,16 @@ export const handler = async (event) => {
     // The record above says this reset happened. It did not, so say so in the
     // log as well as in the response - the log cannot be edited, only added to.
     try {
-      await record({
+      await appendRecord(dynamoClient, AUDIT_TABLE_NAME, {
         targetEmail: email,
         action: 'account.did.reset.aborted',
         admin,
         detail: {
+          // Names the record it retracts, and repeats the DIDs: without them a
+          // reader of two concurrent resets cannot tell which one is void, nor
+          // what the account ended up holding.
+          corrects: recordedAt,
+          previousDid,
           newDid,
           reason: trimmedReason,
           why: raced

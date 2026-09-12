@@ -1,7 +1,7 @@
+import { appendRecord } from '../shared/audit.mjs'
 import {
   DynamoDBClient,
   GetItemCommand,
-  PutItemCommand,
   DeleteItemCommand
 } from '@aws-sdk/client-dynamodb'
 
@@ -13,40 +13,6 @@ const dynamoClient = new DynamoDBClient(
 const ACCOUNT_TABLE_NAME = process.env.ACCOUNT_TABLE_NAME ?? 'wallet-test'
 const AUDIT_TABLE_NAME = process.env.AUDIT_TABLE_NAME ?? 'lcw-admin-audit'
 
-// Appends one record. Conditional on the key not existing, so a record can
-// never overwrite another; the timestamp is nudged forward on a collision,
-// which only happens when one admin acts on one account twice inside a
-// millisecond.
-async function record({ targetEmail, action, admin, detail }) {
-  let createdAt = Date.now()
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const timestamp = new Date(createdAt).toISOString()
-    try {
-      await dynamoClient.send(new PutItemCommand({
-        TableName: AUDIT_TABLE_NAME,
-        Item: {
-          targetEmail: { S: targetEmail },
-          createdAt: { S: timestamp },
-          // One partition for the whole log, so recent-index can serve it
-          // newest-first across every account.
-          log: { S: 'all' },
-          action: { S: action },
-          adminDid: { S: admin.adminDid },
-          adminEmail: { S: admin.adminEmail },
-          detail: { S: JSON.stringify(detail) }
-        },
-        ConditionExpression: 'attribute_not_exists(targetEmail) AND attribute_not_exists(createdAt)'
-      }))
-      return timestamp
-    } catch (error) {
-      if (error.name !== 'ConditionalCheckFailedException') {
-        throw error
-      }
-      createdAt += 1
-    }
-  }
-  throw new Error('Could not append a unique audit record')
-}
 
 const json = (statusCode, body) => ({
   statusCode,
@@ -86,7 +52,12 @@ export const handler = async (event) => {
   try {
     ({ Item: account } = await dynamoClient.send(new GetItemCommand({
       TableName: ACCOUNT_TABLE_NAME,
-      Key: { email: { S: email } }
+      Key: { email: { S: email } },
+      // The row read here is what gets recorded as the means of restoring the
+      // account, so it must be the row as it actually is. A stale replica
+      // would have this record - and any restore from it - name a DID the
+      // account no longer had.
+      ConsistentRead: true
     })))
   } catch (error) {
     console.error('Error reading account before delete:', error)
@@ -110,8 +81,9 @@ export const handler = async (event) => {
   // put the account back. The cost is that a delete which then fails leaves a
   // record of an action that did not complete - the response says so, and the
   // row is still there to prove it.
+  let recordedAt
   try {
-    await record({
+    recordedAt = await appendRecord(dynamoClient, AUDIT_TABLE_NAME, {
       targetEmail: email,
       action: 'account.delete',
       admin,
@@ -126,7 +98,16 @@ export const handler = async (event) => {
     await dynamoClient.send(new DeleteItemCommand({
       TableName: ACCOUNT_TABLE_NAME,
       Key: { email: { S: email } },
-      ConditionExpression: 'attribute_exists(email)'
+      // Conditional on the row that was read and recorded, not merely on one
+      // existing: deleting a row that changed in between would record a
+      // restore payload that no longer matches what was removed.
+      ConditionExpression: removed.did === undefined
+        ? 'attribute_exists(email) AND attribute_not_exists(#did)'
+        : 'attribute_exists(email) AND #did = :did',
+      ExpressionAttributeNames: { '#did': 'did' },
+      ...(removed.did === undefined
+        ? {}
+        : { ExpressionAttributeValues: { ':did': { S: removed.did } } })
     }))
   } catch (error) {
     const raced = error.name === 'ConditionalCheckFailedException'
@@ -135,13 +116,17 @@ export const handler = async (event) => {
     // the log as well as in the response - the log cannot be edited, only
     // added to.
     try {
-      await record({
+      await appendRecord(dynamoClient, AUDIT_TABLE_NAME, {
         targetEmail: email,
         action: 'account.delete.aborted',
         admin,
         detail: {
+          // Names the record it retracts, so a reader of an append-only log
+          // can pair the two even when several actions land together.
+          corrects: recordedAt,
+          removed,
           why: raced
-            ? 'The account was already gone when the deletion was applied; nothing was changed.'
+            ? 'The account changed or was already gone when the deletion was applied; nothing was changed.'
             : 'The write failed; nothing was changed.'
         }
       })
@@ -150,7 +135,7 @@ export const handler = async (event) => {
     }
     return json(raced ? 409 : 500, {
       error: raced
-        ? 'This account was already deleted. Nothing was changed.'
+        ? 'This account changed or was already deleted. Nothing was changed; reload and try again.'
         : 'Failed to delete the account.'
     })
   }

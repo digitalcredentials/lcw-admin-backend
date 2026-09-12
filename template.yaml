@@ -27,13 +27,16 @@ Parameters:
     Default: lcw-admin-audit
   ExpectedHost:
     Type: String
+    # Deliberately no default. An empty value disables host pinning, and a
+    # parameter that can be left out is one that will be: a deploy accepting
+    # defaults would silently ship without the check. Locally, pass
+    # --parameter-overrides ExpectedHost=127.0.0.1:3002 (see README).
+    MinLength: 1
     Description: >
-      Host this API is reached at (e.g. admin-api.lcw-sandbox.org). When set,
-      the authorizer refuses any invocation signed for a different host, so a
-      signature made against one deployment cannot be replayed against another.
-      Leave empty only for local development, where the host is whatever port
-      sam local is on.
-    Default: ''
+      Host this API is reached at (e.g. admin-api.lcw-sandbox.org, or
+      127.0.0.1:3002 under sam local). The authorizer refuses any invocation
+      signed for a different host, so a signature made against one deployment
+      cannot be replayed against another.
   DynamoEndpointUrl:
     Type: String
     Description: >
@@ -98,6 +101,12 @@ Resources:
           - OPTIONS
         AllowHeaders:
           - '*'
+          # Named as well as wildcarded: the Fetch standard excludes
+          # Authorization from the '*' expansion, and while browsers do accept
+          # it today, nothing here should depend on that.
+          - Authorization
+          - Content-Type
+          - Digest
 
   # ---- Authorization
 
@@ -255,8 +264,16 @@ Resources:
     Properties:
       FunctionName: lcw-admin-account-delete
       Description: Removes a wallet account row, recording it first
-      CodeUri: src/account-delete/
-      Handler: index.handler
+      # Rooted at src/ rather than at the function's own directory so that the
+      # shared audit recorder resolves: SAM copies only the CodeUri before
+      # bundling, so a relative import that climbs out of it cannot be found.
+      CodeUri: src/
+      Handler: account-delete/index.handler
+      # Raised above the Globals default: this function appends a record, then
+      # deletes, then may append a correction. Being killed midway is precisely
+      # what leaves the log claiming a deletion that did not happen.
+      Timeout: 10
+      MemorySize: 256
       Policies:
         - Statement:
             - Effect: Allow
@@ -279,6 +296,23 @@ Resources:
             ApiId: !Ref AdminHttpApi
             Method: DELETE
             Path: /accounts/{email}
+    Metadata:
+      # Bundled so the shared audit recorder in src/shared resolves: SAM copies
+      # only this function's CodeUri, so a relative import across directories
+      # has to be inlined at build time. Same mechanism as the authorizer.
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: false
+        Target: es2022
+        Format: esm
+        Platform: node
+        Sourcemap: false
+        OutExtension:
+          - .js=.mjs
+        EntryPoints:
+          - account-delete/index.mjs
+        External:
+          - '@aws-sdk/*'
 
   AccountDeleteLogGroup:
     Type: AWS::Logs::LogGroup
@@ -293,8 +327,12 @@ Resources:
     Properties:
       FunctionName: lcw-admin-account-did-put
       Description: Replaces the controlling DID of a wallet account
-      CodeUri: src/account-did-put/
-      Handler: index.handler
+      # Rooted at src/ for the shared audit recorder, as above.
+      CodeUri: src/
+      Handler: account-did-put/index.handler
+      # As above, and this one also verifies a body digest before it starts.
+      Timeout: 10
+      MemorySize: 256
       Policies:
         - Statement:
             - Effect: Allow
@@ -314,6 +352,23 @@ Resources:
             ApiId: !Ref AdminHttpApi
             Method: PUT
             Path: /accounts/{email}/did
+    Metadata:
+      # Bundled so the shared audit recorder in src/shared resolves: SAM copies
+      # only this function's CodeUri, so a relative import across directories
+      # has to be inlined at build time. Same mechanism as the authorizer.
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: false
+        Target: es2022
+        Format: esm
+        Platform: node
+        Sourcemap: false
+        OutExtension:
+          - .js=.mjs
+        EntryPoints:
+          - account-did-put/index.mjs
+        External:
+          - '@aws-sdk/*'
 
   AccountDidPutLogGroup:
     Type: AWS::Logs::LogGroup

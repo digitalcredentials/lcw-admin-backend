@@ -1,8 +1,8 @@
 {
-  "name": "lcw-admin-account-did-put",
+  "name": "lcw-admin-functions",
   "version": "1.0.0",
   "private": true,
-  "description": "Replaces the controlling DID of a wallet account",
+  "description": "Build root for the bundled handlers: holds the deps they share and the code in src/shared",
   "type": "module",
   "engines": {
     "node": ">=24.0"
