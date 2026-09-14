@@ -1,0 +1,481 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Admin API for Learner Credential Wallet accounts. An HTTP API whose every
+  route is gated by a zcap-signature Lambda authorizer that admits only DIDs
+  registered in this stack's own admin table. Reads and writes the wallet
+  accounts table owned by the lcw-back-end stack; touches nothing else.
+
+Parameters:
+  AccountTableName:
+    Type: String
+    Description: >
+      DynamoDB table of wallet accounts. Owned and declared by the
+      lcw-back-end stack - this stack only references it by name, and must
+      never declare it, or two stacks would contend for one physical table.
+    Default: wallet-test
+  AdminTableName:
+    Type: String
+    Description: >
+      DynamoDB table of admin identities, declared by this stack. Deliberately
+      separate from AccountTableName: an admin is not a wallet account with a
+      flag set, so no wallet account can be escalated into one.
+    Default: lcw-admin
+  AuditTableName:
+    Type: String
+    Description: Append-only record of every admin action, declared by this stack.
+    Default: lcw-admin-audit
+  ExpectedHost:
+    Type: String
+    # Deliberately no default. An empty value disables host pinning, and a
+    # parameter that can be left out is one that will be: a deploy accepting
+    # defaults would silently ship without the check. Locally, pass
+    # --parameter-overrides ExpectedHost=localhost:3002 (see README).
+    MinLength: 1
+    Description: >
+      Host this API is reached at (e.g. admin-api.lcw-sandbox.org, or
+      localhost:3002 under sam local). The authorizer refuses any invocation
+      signed for a different host, so a signature made against one deployment
+      cannot be replayed against another.
+  DynamoEndpointUrl:
+    Type: String
+    Description: >
+      Local development only: a DynamoDB endpoint to use instead of the real
+      service (e.g. http://lcw-dynamodb:8000 for DynamoDB Local reached from a
+      sam local container). Left empty in every deployed environment, where the
+      functions then build their DynamoDB clients with no endpoint override.
+    Default: ''
+
+Globals:
+  Function:
+    Runtime: nodejs24.x
+    Architectures:
+      - x86_64
+    Timeout: 5
+    MemorySize: 128
+    Environment:
+      Variables:
+        ACCOUNT_TABLE_NAME: !Ref AccountTableName
+        AUDIT_TABLE_NAME: !Ref AuditTableName
+        # Not AWS_ENDPOINT_URL_DYNAMODB: sam local renders an unset parameter
+        # as an empty string rather than omitting the variable, and an empty
+        # endpoint is not something the SDK ignores. Each function reads this
+        # one itself and overrides only when it is non-empty - the same shape
+        # as AWS_ENDPOINT_URL_S3 in was-server-aws.
+        DYNAMO_ENDPOINT_URL: !Ref DynamoEndpointUrl
+
+Resources:
+  # The admin API. An HTTP API for the same reasons as the WAS server: its CORS
+  # is a real gateway feature injected into every response, and the $default
+  # stage serves at the root so signed URLs carry no /Prod prefix.
+  AdminHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Name: lcw-admin-api
+      Auth:
+        DefaultAuthorizer: AdminZcapAuthorizer
+        Authorizers:
+          AdminZcapAuthorizer:
+            AuthorizerPayloadFormatVersion: '2.0'
+            EnableSimpleResponses: true
+            EnableFunctionDefaultPermissions: true
+            FunctionArn: !GetAtt AdminZcapAuthorizerFunction.Arn
+            Identity:
+              Headers:
+                - Authorization
+              # Every invocation is signed over its own request, so a cached
+              # decision would be meaningless - and worse, would let a replay
+              # of one signed request authorize a different one.
+              ReauthorizeEvery: 0
+      # Wildcard origin is safe: authorization is a per-request signature, not
+      # a cookie or bearer token, so AllowCredentials stays false and a hostile
+      # page cannot borrow an admin's session.
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+        AllowHeaders:
+          - '*'
+          # Named as well as wildcarded: the Fetch standard excludes
+          # Authorization from the '*' expansion, and while browsers do accept
+          # it today, nothing here should depend on that.
+          - Authorization
+          - Content-Type
+          - Digest
+
+  # ---- Authorization
+
+  # Verifies the zcap invocation on every route. The invoking DID is taken from
+  # the signature's own keyId and looked up in the admin table, so identity is
+  # never asserted by the client.
+  AdminZcapAuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: lcw-admin-authorizer
+      Description: Admits zcap-signed requests from DIDs registered in the admin table
+      CodeUri: src/authorizer/
+      Handler: index.handler
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          ADMIN_TABLE_NAME: !Ref AdminTableName
+          EXPECTED_HOST: !Ref ExpectedHost
+      Policies:
+        # Query on the did-index only: the authorizer answers one question, and
+        # has no reason to be able to read the admin table any other way.
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource:
+                - !GetAtt AdminTable.Arn
+                - !Sub '${AdminTable.Arn}/index/did-index'
+      LoggingConfig:
+        LogGroup: !Ref AuthorizerLogGroup
+    Metadata:
+      # Bundled: the @interop zcap packages are ESM and are require()d mid-graph
+      # by their CJS dependencies, which the Lambda runtime refuses
+      # (ERR_REQUIRE_ESM). esbuild resolves that at build time.
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: false
+        Target: es2022
+        Format: esm
+        Platform: node
+        Sourcemap: false
+        OutExtension:
+          - .js=.mjs
+        EntryPoints:
+          - index.mjs
+        External:
+          - '@aws-sdk/*'
+        # undici (pulled in transitively by the document loader) require()s
+        # node builtins from inside a CJS module. esbuild's ESM output has no
+        # require, so without this the function dies on cold start with
+        # "Dynamic require of node:assert is not supported".
+        Banner:
+          - js=import { createRequire as __lcwCreateRequire } from 'module'; const require = __lcwCreateRequire(import.meta.url);
+
+  AuthorizerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/lcw-admin-authorizer
+      RetentionInDays: 30
+
+  # ---- Routes
+
+  # Login is just an authorized whoami: the authorizer has already verified the
+  # signature, so this reports which admin the caller proved they are. There is
+  # no session to issue - every subsequent request is signed the same way.
+  AdminLoginFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: lcw-admin-login
+      Description: Reports the authenticated admin identity
+      CodeUri: src/admin-login/
+      Handler: index.handler
+      LoggingConfig:
+        LogGroup: !Ref LoginLogGroup
+      Events:
+        LoginRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AdminHttpApi
+            Method: POST
+            Path: /login
+
+  LoginLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/lcw-admin-login
+      RetentionInDays: 30
+
+  AccountsListFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: lcw-admin-accounts-list
+      Description: Lists wallet accounts, one page per call
+      CodeUri: src/accounts-list/
+      Handler: index.handler
+      Timeout: 10
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:Scan
+              Resource: !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AccountTableName}
+      LoggingConfig:
+        LogGroup: !Ref AccountsListLogGroup
+      Events:
+        ListRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AdminHttpApi
+            Method: GET
+            Path: /accounts
+
+  AccountsListLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/lcw-admin-accounts-list
+      RetentionInDays: 30
+
+  AccountGetFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: lcw-admin-account-get
+      Description: Reads one wallet account by email, with its action history
+      CodeUri: src/account-get/
+      Handler: index.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource: !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AccountTableName}
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource: !GetAtt AuditTable.Arn
+      LoggingConfig:
+        LogGroup: !Ref AccountGetLogGroup
+      Events:
+        GetRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AdminHttpApi
+            Method: GET
+            Path: /accounts/{email}
+
+  AccountGetLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/lcw-admin-account-get
+      RetentionInDays: 30
+
+  # Revokes an account's access by removing its row. Deliberately has no S3
+  # permission: the account's Wallet Attached Storage space and the credentials
+  # in it are untouched, and the audit record keeps the whole row, so the
+  # deletion can be undone by putting it back.
+  AccountDeleteFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: lcw-admin-account-delete
+      Description: Removes a wallet account row, recording it first
+      # Rooted at src/ rather than at the function's own directory so that the
+      # shared audit recorder resolves: SAM copies only the CodeUri before
+      # bundling, so a relative import that climbs out of it cannot be found.
+      CodeUri: src/
+      Handler: account-delete/index.handler
+      # Raised above the Globals default: this function appends a record, then
+      # deletes, then may append a correction. Being killed midway is precisely
+      # what leaves the log claiming a deletion that did not happen.
+      Timeout: 10
+      MemorySize: 256
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:DeleteItem
+              Resource: !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AccountTableName}
+            # PutItem only: this is what makes the log append-only in fact and
+            # not merely by convention. DynamoDBWritePolicy would also grant
+            # UpdateItem and DeleteItem.
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt AuditTable.Arn
+      LoggingConfig:
+        LogGroup: !Ref AccountDeleteLogGroup
+      Events:
+        DeleteRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AdminHttpApi
+            Method: DELETE
+            Path: /accounts/{email}
+    Metadata:
+      # Bundled so the shared audit recorder in src/shared resolves: SAM copies
+      # only this function's CodeUri, so a relative import across directories
+      # has to be inlined at build time. Same mechanism as the authorizer.
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: false
+        Target: es2022
+        Format: esm
+        Platform: node
+        Sourcemap: false
+        OutExtension:
+          - .js=.mjs
+        EntryPoints:
+          - account-delete/index.mjs
+        External:
+          - '@aws-sdk/*'
+
+  AccountDeleteLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/lcw-admin-account-delete
+      RetentionInDays: 30
+
+  # Resets the DID that controls an account. This is a complete handover of the
+  # account and its space, so the previous DID is always recorded.
+  AccountDidPutFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: lcw-admin-account-did-put
+      Description: Replaces the controlling DID of a wallet account
+      # Rooted at src/ for the shared audit recorder, as above.
+      CodeUri: src/
+      Handler: account-did-put/index.handler
+      # As above, and this one also verifies a body digest before it starts.
+      Timeout: 10
+      MemorySize: 256
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource: !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AccountTableName}
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt AuditTable.Arn
+      LoggingConfig:
+        LogGroup: !Ref AccountDidPutLogGroup
+      Events:
+        DidRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AdminHttpApi
+            Method: PUT
+            Path: /accounts/{email}/did
+    Metadata:
+      # Bundled so the shared audit recorder in src/shared resolves: SAM copies
+      # only this function's CodeUri, so a relative import across directories
+      # has to be inlined at build time. Same mechanism as the authorizer.
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: false
+        Target: es2022
+        Format: esm
+        Platform: node
+        Sourcemap: false
+        OutExtension:
+          - .js=.mjs
+        EntryPoints:
+          - account-did-put/index.mjs
+        External:
+          - '@aws-sdk/*'
+
+  AccountDidPutLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/lcw-admin-account-did-put
+      RetentionInDays: 30
+
+  AuditListFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: lcw-admin-audit-list
+      Description: Lists recorded admin actions, newest first
+      CodeUri: src/audit-list/
+      Handler: index.handler
+      Timeout: 10
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource:
+                - !GetAtt AuditTable.Arn
+                - !Sub '${AuditTable.Arn}/index/recent-index'
+      LoggingConfig:
+        LogGroup: !Ref AuditListLogGroup
+      Events:
+        AuditRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AdminHttpApi
+            Method: GET
+            Path: /audit
+
+  AuditListLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/lcw-admin-audit-list
+      RetentionInDays: 30
+
+  # ---- Tables owned by this stack
+
+  # Admin identities. Keyed by email to mirror the accounts table, but looked
+  # up by did (the authorizer's only input), which is what the GSI is for.
+  AdminTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref AdminTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: email
+          AttributeType: S
+        - AttributeName: did
+          AttributeType: S
+      KeySchema:
+        - AttributeName: email
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: did-index
+          KeySchema:
+            - AttributeName: did
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  # Append-only in fact: every function that writes here is granted PutItem and
+  # nothing else, and each write is conditional on the key not already existing,
+  # so a record cannot be altered or overwritten once made.
+  #
+  # Keyed by the account acted on, so one account's history is a Query. The
+  # global feed needs a different key, hence recent-index: every record carries
+  # the same partition value, which makes the whole log one time-ordered
+  # partition that can be read newest-first and paged. That is a hot partition
+  # by design, and an acceptable one - the writes are a handful of deliberate
+  # human actions, not traffic.
+  AuditTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref AuditTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: targetEmail
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+        - AttributeName: log
+          AttributeType: S
+      KeySchema:
+        - AttributeName: targetEmail
+          KeyType: HASH
+        - AttributeName: createdAt
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: recent-index
+          KeySchema:
+            - AttributeName: log
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+Outputs:
+  AdminApiUrl:
+    Description: Base URL of the admin API
+    Value: !Sub https://${AdminHttpApi}.execute-api.${AWS::Region}.amazonaws.com
+  AdminTableName:
+    Description: Table of admin identities
+    Value: !Ref AdminTable
+  AuditTableName:
+    Description: Table of recorded admin actions
+    Value: !Ref AuditTable

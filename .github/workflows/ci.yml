@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  # Every pull request, whatever its base. Filtering on `branches: [main]`
+  # here would filter on the *base* branch, silently skipping stacked pull
+  # requests that target another branch -- which is exactly when a check is
+  # most useful.
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      # The root postinstall also installs src/authorizer's own dependencies,
+      # which its tests import.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+# `sam build` and `sam validate` are not run here yet. They need the SAM CLI in
+# the runner and would roughly triple the job; the unit tests cover the
+# authorizer's signature verification, which is the part worth gating on first.
