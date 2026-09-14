@@ -8,7 +8,7 @@
     "node": ">=24"
   },
   "scripts": {
-    "postinstall": "npm ci --prefix src/authorizer",
+    "postinstall": "npm ci --include=dev --prefix src/authorizer",
     "test": "npm --prefix src/authorizer test",
     "add-admin": "node scripts/add-admin.mjs"
   },

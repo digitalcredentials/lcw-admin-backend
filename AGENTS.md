@@ -10,9 +10,10 @@ covers only how to get a working environment and what to run in it.
 
 ## What you need running
 
-The admin API talks to **DynamoDB only** — no S3, no WAS, no login API. Every
-handler imports `@aws-sdk/client-dynamodb` and nothing else. So the admin loop
-is three processes, not the wallet's six:
+The admin API talks to **DynamoDB only** — no S3, no WAS, no login API. The
+only AWS SDK client any handler imports is `@aws-sdk/client-dynamodb`; the rest
+of their dependencies are the `@interop` signing and digest libraries. So the
+admin loop is three processes, not the wallet's six:
 
 | Process | Port | From |
 | --- | --- | --- |

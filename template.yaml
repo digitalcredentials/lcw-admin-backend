@@ -30,11 +30,11 @@ Parameters:
     # Deliberately no default. An empty value disables host pinning, and a
     # parameter that can be left out is one that will be: a deploy accepting
     # defaults would silently ship without the check. Locally, pass
-    # --parameter-overrides ExpectedHost=127.0.0.1:3002 (see README).
+    # --parameter-overrides ExpectedHost=localhost:3002 (see README).
     MinLength: 1
     Description: >
       Host this API is reached at (e.g. admin-api.lcw-sandbox.org, or
-      127.0.0.1:3002 under sam local). The authorizer refuses any invocation
+      localhost:3002 under sam local). The authorizer refuses any invocation
       signed for a different host, so a signature made against one deployment
       cannot be replayed against another.
   DynamoEndpointUrl:
