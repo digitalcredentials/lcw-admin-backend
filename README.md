@@ -189,8 +189,7 @@ substitutes DynamoDB Local for the real table, so nothing here needs AWS
 credentials. Bring that up first, then:
 
 ```bash
-npm install                      # scripts and tests
-npm --prefix src/authorizer install
+npm ci                           # scripts and tests, authorizer deps included
 sam build
 
 # register yourself as an admin (creates the local tables if missing)

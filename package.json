@@ -4,7 +4,11 @@
   "description": "Admin API for Learner Credential Wallet accounts, on AWS SAM",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
+    "postinstall": "npm ci --prefix src/authorizer",
     "test": "npm --prefix src/authorizer test",
     "add-admin": "node scripts/add-admin.mjs"
   },
